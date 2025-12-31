@@ -27,13 +27,13 @@ app.post("/create-checkout-session", async (req, res) => {
           price_data: {
             currency: "eur",
             product_data: { name: "Credits" },
-            unit_amount: quantity * 100, // z.B. 1 Credit = 1 EUR
+            unit_amount: 199, // z.B. 1 Credit = 1 EUR
           },
           quantity: 1,
         },
       ],
-      success_url: `https://dein-frontend-url.com/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `https://dein-frontend-url.com/cancel`,
+      success_url: `https://schriftbot.com/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://schriftbot.com/cancel`,
       client_reference_id: uid, // User-ID speichern
     });
 

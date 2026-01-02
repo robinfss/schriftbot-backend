@@ -9,7 +9,9 @@ const app = express();
 
 // 1. Firebase Admin Initialisierung
 // Du musst die Datei 'serviceAccountKey.json' aus deinem Firebase Projekt herunterladen
-const serviceAccount = require("./serviceAccountKey.json");
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : require("./serviceAccountKey.json"); // Fallback für lokales Testen
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),

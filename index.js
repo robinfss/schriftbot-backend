@@ -92,7 +92,9 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card", "giropay", "klarna"], // Klarna/Giropay für Schüler wichtig!
+      automatic_payment_methods: {
+        enabled: true,
+      },
       mode: "payment",
       client_reference_id: uid,
       metadata: {

@@ -48,19 +48,40 @@ app.post(
 
       const userId = session.client_reference_id;
       const creditAmount = parseInt(session.metadata.credits);
+      const sessionId = session.id; // Die eindeutige Stripe ID
+      const amountPaid = session.amount_total / 100; // Betrag in Euro
 
       console.log(
-        `Zahlung erfolgreich! User: ${userId}, Credits: ${creditAmount}`
+        `Zahlung erfolgreich! User: ${userId}, Credits: ${creditAmount}, Session: ${sessionId}`
       );
 
       try {
-        // Update in Firestore: Credits zum bestehenden Wert hinzufügen
         const userRef = db.collection("users").doc(userId);
+
+        // Update in Firestore
         await userRef.set(
-          { credits: admin.firestore.FieldValue.increment(creditAmount) },
+          {
+            // 1. Credits erhöhen
+            credits: admin.firestore.FieldValue.increment(creditAmount),
+
+            // 2. Zahlung in Liste speichern
+            payments: admin.firestore.FieldValue.arrayUnion({
+              sessionId: sessionId,
+              amount: amountPaid,
+              credits: creditAmount,
+              date: new Date().toISOString(),
+              status: "completed",
+            }),
+
+            // 3. Letztes Update speichern
+            lastPurchase: new Date().toISOString(),
+          },
           { merge: true }
         );
-        console.log("Firestore erfolgreich aktualisiert.");
+
+        console.log(
+          `Firestore für User ${userId} aktualisiert. Zahlung geloggt.`
+        );
       } catch (error) {
         console.error("Fehler beim Firestore Update:", error);
       }
@@ -80,34 +101,28 @@ app.get("/", (req, res) => {
 // Endpoint zum Erstellen der Checkout Session
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { uid, quantity } = req.body;
+    const { uid, email } = req.body;
 
-    // Preislogik (Beispielhaft für 10 oder 20 Credits)
-    let unitAmount = 199; // 1,99€git add .
+    if (!uid) {
+      return res.status(400).json({ error: "User ID fehlt." });
+    }
 
     const session = await stripe.checkout.sessions.create({
-      // Wir lassen payment_method_types weg, damit Stripe deine
-      // Dashboard-Einstellungen (Klarna, Giropay, etc.) nutzt.
-
       mode: "payment",
       client_reference_id: uid,
-      // Wichtig: Wir nutzen die E-Mail des Nutzers, falls vorhanden,
-      // damit das Feld bei Stripe schon ausgefüllt ist.
-      customer_email: req.body.email || undefined,
+      customer_email: email || undefined,
 
+      // WICHTIG: Die Credits müssen trotzdem in die Metadata,
+      // damit dein Webhook weiß, wie viele Credits er gutschreiben soll!
       metadata: {
-        credits: 10, // Die Anzahl der Credits für den Webhook
+        credits: 20,
       },
+
       line_items: [
         {
-          price_data: {
-            currency: "eur",
-            product_data: {
-              name: `${quantity} Schriftbot Credits`,
-              description: "Digitale Credits für Schriftbot.com",
-            },
-            unit_amount: unitAmount,
-          },
+          // Hier deine Preis-ID aus dem Stripe Dashboard einfügen:
+          // Du findest sie unter "Produkte" -> Dein Produkt -> "Preise"
+          price: "price_1SlQSb49gql0qC525SZpLLOg",
           quantity: 1,
         },
       ],

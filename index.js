@@ -35,86 +35,134 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
+      console.error(`❌ Webhook Signatur Fehler: ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
     console.log("✅ Webhook empfangen:", event.type);
 
-    // --- EINZIGES EVENT: invoice.paid (Erstkauf + Verlängerung) ---
-    if (event.type === "invoice.paid") {
-      const invoice = event.data.object;
+    // =============================================================================
+    // ERSTKAUF: checkout.session.completed (Tag 1)
+    // =============================================================================
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const uid = session.client_reference_id;
 
-      // Prüfen ob Subscription existiert
-      if (!invoice.subscription) {
-        console.log("ℹ️ Keine Subscription in Invoice - übersprungen");
+      if (!uid) {
+        console.error("❌ Keine UID in Checkout Session gefunden");
         return res.json({ received: true });
       }
 
       try {
-        // 1. Subscription abrufen um UID zu bekommen
-        const subscription = await stripe.subscriptions.retrieve(
-          invoice.subscription
-        );
-        const uid = subscription.metadata.uid;
-
-        if (!uid) {
-          console.error("❌ Keine UID in Subscription Metadata gefunden");
-          console.error("Subscription Metadata:", subscription.metadata);
-          return res.json({ received: true });
-        }
-
-        console.log(`👤 UID gefunden: ${uid}`);
-
-        // 2. Produktdaten abrufen
-        const product = await stripe.products.retrieve(
-          invoice.lines.data[0].price.product
+        const sessionWithItems = await stripe.checkout.sessions.retrieve(
+          session.id,
+          { expand: ["line_items.data.price.product"] }
         );
 
+        const product = sessionWithItems.line_items.data[0].price.product;
         const creditsToAdd = parseInt(product.metadata.credits || "0");
         const isUnlimited = product.metadata.isUnlimited === "true";
         const planName = product.metadata.planName || product.name;
 
-        // 3. Typ der Zahlung erkennen
-        const isFirstPurchase =
-          invoice.billing_reason === "subscription_create";
-        const isRenewal = invoice.billing_reason === "subscription_cycle";
+        console.log(
+          `🌟 ERSTKAUF: User ${uid} → ${creditsToAdd} Credits (${planName})`
+        );
 
-        if (isFirstPurchase) {
-          console.log(
-            `🌟 Erstkauf: User ${uid} erhält ${creditsToAdd} Credits (${planName})`
-          );
-        } else if (isRenewal) {
-          console.log(
-            `🔄 Verlängerung: User ${uid} erhält ${creditsToAdd} Credits (${planName})`
-          );
-        } else {
-          console.log(
-            `💰 Zahlung: User ${uid} erhält ${creditsToAdd} Credits (${planName})`
-          );
-        }
-
-        // 4. Firestore aktualisieren
         await updateFirestoreUser(uid, {
           creditsToAdd,
           isUnlimited,
           planName,
-          subscriptionId: invoice.subscription,
-          customerId: invoice.customer,
-          invoiceId: invoice.id,
-          isRenewal: !isFirstPurchase,
+          subscriptionId: session.subscription,
+          customerId: session.customer,
+          invoiceId: session.invoice,
+          isRenewal: false,
         });
       } catch (err) {
-        console.error("❌ Fehler bei invoice.paid:", err);
+        console.error("❌ Fehler bei Erstkauf:", err);
         console.error("Stack:", err.stack);
       }
     }
 
-    // --- ABO GEKÜNDIGT ---
+    // =============================================================================
+    // MONATLICHE VERLÄNGERUNG: invoice.paid (Tag 30, 60, 90, ...)
+    // =============================================================================
+    if (event.type === "invoice.paid") {
+      const invoice = event.data.object;
+
+      // Erste Rechnung überspringen (wird von checkout.session.completed verarbeitet)
+      if (invoice.billing_reason === "subscription_create") {
+        console.log(
+          "ℹ️ Erst-Rechnung ignoriert (wird von checkout.session.completed verarbeitet)"
+        );
+        return res.json({ received: true });
+      }
+
+      // NUR monatliche Verlängerungen verarbeiten
+      if (invoice.billing_reason === "subscription_cycle") {
+        console.log(`🔄 MONATLICHE VERLÄNGERUNG für Invoice: ${invoice.id}`);
+
+        try {
+          if (!invoice.subscription) {
+            console.error("❌ Keine Subscription in Invoice");
+            return res.json({ received: true });
+          }
+
+          // Subscription abrufen um UID zu bekommen
+          const subscription = await stripe.subscriptions.retrieve(
+            invoice.subscription
+          );
+          const uid = subscription.metadata.uid;
+
+          if (!uid) {
+            console.error("❌ Keine UID in Subscription Metadata");
+            console.error("Subscription ID:", invoice.subscription);
+            console.error("Metadata:", subscription.metadata);
+            return res.json({ received: true });
+          }
+
+          console.log(`👤 UID: ${uid}`);
+
+          // Produktdaten abrufen
+          const product = await stripe.products.retrieve(
+            invoice.lines.data[0].price.product
+          );
+
+          const creditsToAdd = parseInt(product.metadata.credits || "0");
+          const isUnlimited = product.metadata.isUnlimited === "true";
+          const planName = product.metadata.planName || product.name;
+
+          console.log(
+            `💰 Verlängerung: ${creditsToAdd} Credits werden addiert (${planName})`
+          );
+
+          await updateFirestoreUser(uid, {
+            creditsToAdd,
+            isUnlimited,
+            planName,
+            subscriptionId: invoice.subscription,
+            customerId: invoice.customer,
+            invoiceId: invoice.id,
+            isRenewal: true,
+          });
+        } catch (err) {
+          console.error("❌ Fehler bei monatlicher Verlängerung:", err);
+          console.error("Stack:", err.stack);
+        }
+      } else {
+        console.log(
+          `ℹ️ Invoice mit billing_reason "${invoice.billing_reason}" ignoriert`
+        );
+      }
+    }
+
+    // =============================================================================
+    // ABO GEKÜNDIGT
+    // =============================================================================
     if (event.type === "customer.subscription.deleted") {
       const subscription = event.data.object;
       const uid = subscription.metadata.uid;
 
-      console.log(`🚫 Abo gekündigt für User: ${uid}`);
+      console.log(`🚫 ABO GEKÜNDIGT für User: ${uid}`);
 
       if (uid) {
         try {
@@ -129,14 +177,18 @@ app.post(
             },
             { merge: true }
           );
-          console.log(`✅ Abo für User ${uid} beendet. Zugriff entzogen.`);
+          console.log(
+            `✅ User ${uid}: Zugriff entzogen, Credits auf 0 gesetzt`
+          );
         } catch (err) {
           console.error("❌ Firestore Error (subscription.deleted):", err);
         }
       }
     }
 
-    // --- ZAHLUNG FEHLGESCHLAGEN ---
+    // =============================================================================
+    // ZAHLUNG FEHLGESCHLAGEN
+    // =============================================================================
     if (event.type === "invoice.payment_failed") {
       const invoice = event.data.object;
 
@@ -148,7 +200,7 @@ app.post(
         );
         const uid = subscription.metadata.uid;
 
-        console.log(`⚠️ Zahlung fehlgeschlagen für User: ${uid}`);
+        console.log(`⚠️ ZAHLUNG FEHLGESCHLAGEN für User: ${uid}`);
 
         if (uid) {
           await db.collection("users").doc(uid).set(
@@ -158,7 +210,7 @@ app.post(
             },
             { merge: true }
           );
-          console.log(`⚠️ Status für User ${uid} auf "past_due" gesetzt.`);
+          console.log(`⚠️ User ${uid}: Status auf "past_due" gesetzt`);
         }
       } catch (err) {
         console.error("❌ Fehler bei payment_failed:", err);
@@ -169,7 +221,9 @@ app.post(
   }
 );
 
-// --- HILFSFUNKTION FÜR FIRESTORE ---
+// =============================================================================
+// HILFSFUNKTION: Firestore Update mit Idempotenz & Credit-Addition
+// =============================================================================
 async function updateFirestoreUser(uid, data) {
   const userRef = db.collection("users").doc(uid);
 
@@ -179,9 +233,7 @@ async function updateFirestoreUser(uid, data) {
     doc.exists &&
     doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
   ) {
-    console.log(
-      `⚠️ Invoice ${data.invoiceId} bereits verarbeitet - übersprungen`
-    );
+    console.log(`⚠️ Invoice ${data.invoiceId} bereits verarbeitet - ABBRUCH`);
     return;
   }
 
@@ -189,13 +241,13 @@ async function updateFirestoreUser(uid, data) {
   const currentCredits = currentData.credits || 0;
 
   // Bei Unlimited: Immer 999999
-  // Bei Limited: Credits ADDIEREN (nicht ersetzen!)
+  // Bei Limited: Credits ADDIEREN (wichtig für Verlängerung!)
   const newCredits = data.isUnlimited
     ? 999999
     : currentCredits + data.creditsToAdd;
 
   console.log(
-    `📊 Credits Update: ${currentCredits} + ${data.creditsToAdd} = ${newCredits}`
+    `📊 Credits: ${currentCredits} + ${data.creditsToAdd} = ${newCredits}`
   );
 
   await userRef.set(
@@ -220,14 +272,18 @@ async function updateFirestoreUser(uid, data) {
   );
 
   console.log(
-    `✅ Firestore aktualisiert für User ${uid}: ${newCredits} Credits`
+    `✅ Firestore aktualisiert: User ${uid} hat jetzt ${newCredits} Credits`
   );
 }
 
-// --- JSON MIDDLEWARE ---
+// =============================================================================
+// JSON MIDDLEWARE
+// =============================================================================
 app.use(express.json());
 
-// --- CHECKOUT SESSION ---
+// =============================================================================
+// CHECKOUT SESSION ERSTELLEN
+// =============================================================================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
@@ -250,7 +306,7 @@ app.post("/create-checkout-session", async (req, res) => {
       client_reference_id: uid,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
-        metadata: { uid }, // ✅ WICHTIG: UID hier setzen!
+        metadata: { uid }, // ✅ KRITISCH: UID muss hier gesetzt sein!
       },
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,
@@ -264,7 +320,12 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "active" }));
+// =============================================================================
+// HEALTH CHECK
+// =============================================================================
+app.get("/", (req, res) =>
+  res.json({ status: "active", timestamp: new Date().toISOString() })
+);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));

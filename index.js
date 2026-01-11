@@ -115,6 +115,32 @@ app.post(
       }
     }
 
+    // --- FALL 3: ABO GEKÜNDIGT ---
+    if (event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object;
+      const uid = subscription.metadata.uid;
+
+      console.log(`🚫 Abo gekündigt für User: ${uid}`);
+
+      if (uid) {
+        try {
+          await db.collection("users").doc(uid).set(
+            {
+              credits: 0,
+              isUnlimited: false,
+              plan: "expired",
+              lastPaymentStatus: "canceled",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          console.log(`✅ Abo für User ${uid} beendet. Zugriff entzogen.`);
+        } catch (err) {
+          console.error("❌ Firestore Error (subscription.deleted):", err);
+        }
+      }
+    }
+
     res.json({ received: true });
   }
 );

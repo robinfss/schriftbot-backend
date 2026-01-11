@@ -320,6 +320,40 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
+// Endpunkt zum Vorbereiten der Löschung (Stripe & Firestore)
+app.post("/delete-user-data", async (req, res) => {
+  const { uid } = req.body; // In Produktion: Nutze ID-Token Verifizierung!
+
+  try {
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+
+      // 1. Stripe-Kunde löschen (beendet sofort alle Abos)
+      if (userData.stripeCustomerId) {
+        try {
+          await stripe.customers.del(userData.stripeCustomerId);
+          console.log(`Stripe Customer ${userData.stripeCustomerId} gelöscht.`);
+        } catch (stripeErr) {
+          console.error("Stripe Fehler beim Löschen:", stripeErr);
+          // Wir machen trotzdem weiter, falls der Kunde bei Stripe nicht existiert
+        }
+      }
+
+      // 2. Firestore-Daten löschen
+      await userRef.delete();
+      console.log(`Firestore Daten für ${uid} gelöscht.`);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Löschfehler:", err);
+    res.status(500).json({ error: "Fehler beim Bereinigen der Daten" });
+  }
+});
+
 // =============================================================================
 // HEALTH CHECK
 // =============================================================================

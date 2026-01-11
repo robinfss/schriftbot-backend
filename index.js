@@ -21,7 +21,83 @@ const db = admin.firestore();
 
 app.use(cors());
 
-// --- 2. WEBHOOK ENDPOINT ---
+// --- 2. HILFSFUNKTION: Credits vergeben ---
+async function grantCreditsToUser(invoice) {
+  try {
+    // 1. Subscription abrufen (kann null sein bei erster Zahlung)
+    let subscriptionId = invoice.subscription;
+
+    // Falls keine direkte Subscription, versuche über subscription_details
+    if (!subscriptionId && invoice.subscription_details?.metadata) {
+      console.log(
+        "⚠️ Subscription noch nicht verknüpft, nutze checkout.session"
+      );
+      // In diesem Fall müssen wir die checkout.session.completed nutzen
+      return null;
+    }
+
+    if (!subscriptionId) {
+      console.log("⚠️ Keine Subscription gefunden - Event wird übersprungen");
+      return null;
+    }
+
+    console.log(`🔍 Rufe Subscription ab: ${subscriptionId}`);
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+
+    const uid = subscription.metadata.uid;
+    console.log(`👤 UID gefunden: ${uid}`);
+
+    if (!uid) {
+      console.error(`⚠️ Kritisch: Keine UID in Subscription ${subscriptionId}`);
+      console.error(`Metadata:`, subscription.metadata);
+      return null;
+    }
+
+    // 2. Produktdaten abrufen
+    const subscriptionItem = subscription.items.data[0];
+    const priceId = subscriptionItem.price.id;
+    console.log(`💰 Price ID: ${priceId}`);
+
+    const product = await stripe.products.retrieve(
+      subscriptionItem.price.product
+    );
+    console.log(`📦 Product Metadata:`, product.metadata);
+
+    const credits = parseInt(product.metadata.credits || "0");
+    const isUnlimited = product.metadata.isUnlimited === "true";
+    const planName = product.metadata.planName || product.name;
+
+    console.log(
+      `🎯 Credits: ${credits}, Unlimited: ${isUnlimited}, Plan: ${planName}`
+    );
+
+    // 3. Firestore Update
+    const updateData = {
+      credits: isUnlimited ? 999999 : credits,
+      isUnlimited: isUnlimited,
+      plan: planName,
+      lastPaymentStatus: "active",
+      subscriptionId: subscriptionId,
+      stripeCustomerId: invoice.customer,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    console.log(`💾 Firestore Update für User ${uid}:`, updateData);
+
+    await db.collection("users").doc(uid).set(updateData, { merge: true });
+
+    console.log(
+      `✅ ERFOLG: User ${uid} hat ${credits} Credits für Plan "${planName}" erhalten.`
+    );
+    return uid;
+  } catch (err) {
+    console.error("❌ FEHLER in grantCreditsToUser:", err);
+    console.error("Stack Trace:", err.stack);
+    throw err;
+  }
+}
+
+// --- 3. WEBHOOK ENDPOINT ---
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -35,87 +111,66 @@ app.post(
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
-      console.log(`✅ Webhook empfangen: ${event.type}`); // ✅ DEBUG
+      console.log(`✅ Webhook empfangen: ${event.type}`);
     } catch (err) {
       console.error(`❌ Webhook Signatur Fehler: ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // --- LOGIK: RECHNUNG BEZAHLT (invoice.payment_succeeded) ---
-    if (event.type === "invoice.payment_succeeded") {
-      // ✅ KORRIGIERT!
-      const invoice = event.data.object;
-      console.log(`📄 Invoice bezahlt: ${invoice.id}`); // ✅ DEBUG
+    // --- WICHTIG: checkout.session.completed für Erstkauf ---
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      console.log(`🛒 Checkout Session completed: ${session.id}`);
 
-      if (!invoice.subscription) {
-        console.log("⚠️ Keine Subscription in Invoice - übersprungen");
-        return res.json({ received: true });
+      if (session.mode === "subscription") {
+        const uid = session.client_reference_id;
+        const subscriptionId = session.subscription;
+
+        console.log(`👤 Client Reference ID (UID): ${uid}`);
+        console.log(`🔗 Subscription ID: ${subscriptionId}`);
+
+        if (uid && subscriptionId) {
+          try {
+            // Subscription Metadata updaten mit UID (falls noch nicht gesetzt)
+            await stripe.subscriptions.update(subscriptionId, {
+              metadata: { uid },
+            });
+            console.log(
+              `✅ Subscription Metadata aktualisiert mit UID: ${uid}`
+            );
+          } catch (err) {
+            console.error(
+              "❌ Fehler beim Update der Subscription Metadata:",
+              err
+            );
+          }
+        }
       }
+    }
+
+    // --- LOGIK: RECHNUNG BEZAHLT (invoice.paid) ---
+    if (event.type === "invoice.paid") {
+      const invoice = event.data.object;
+      console.log(`📄 Invoice bezahlt: ${invoice.id}`);
 
       try {
-        // 1. Subscription abrufen
-        console.log(`🔍 Rufe Subscription ab: ${invoice.subscription}`); // ✅ DEBUG
-        const subscription = await stripe.subscriptions.retrieve(
-          invoice.subscription
-        );
-
-        const uid = subscription.metadata.uid;
-        console.log(`👤 UID gefunden: ${uid}`); // ✅ DEBUG
-
-        if (!uid) {
-          console.error(
-            `⚠️ Kritisch: Keine UID in Subscription ${invoice.subscription}`
-          );
-          console.error(`Metadata:`, subscription.metadata); // ✅ DEBUG
-          return res.json({
-            status: "error",
-            message: "UID missing in metadata",
-          });
-        }
-
-        // 2. Produktdaten abrufen
-        const subscriptionItem = subscription.items.data[0];
-        const priceId = subscriptionItem.price.id;
-        console.log(`💰 Price ID: ${priceId}`); // ✅ DEBUG
-
-        const product = await stripe.products.retrieve(
-          subscriptionItem.price.product
-        );
-        console.log(`📦 Product Metadata:`, product.metadata); // ✅ DEBUG
-
-        const credits = parseInt(product.metadata.credits || "0");
-        const isUnlimited = product.metadata.isUnlimited === "true";
-        const planName = product.metadata.planName || product.name;
-
-        console.log(
-          `🎯 Credits: ${credits}, Unlimited: ${isUnlimited}, Plan: ${planName}`
-        ); // ✅ DEBUG
-
-        // 3. Firestore Update
-        const updateData = {
-          credits: isUnlimited ? 999999 : credits,
-          isUnlimited: isUnlimited,
-          plan: planName,
-          lastPaymentStatus: "active",
-          subscriptionId: invoice.subscription,
-          stripeCustomerId: invoice.customer,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        console.log(`💾 Firestore Update für User ${uid}:`, updateData); // ✅ DEBUG
-
-        await db.collection("users").doc(uid).set(updateData, { merge: true });
-
-        console.log(
-          `✅ ERFOLG: User ${uid} hat ${credits} Credits für Plan "${planName}" erhalten.`
-        );
+        await grantCreditsToUser(invoice);
       } catch (err) {
-        console.error(
-          "❌ FEHLER beim Firestore Update (invoice.payment_succeeded):",
-          err
-        );
-        console.error("Stack Trace:", err.stack); // ✅ DEBUG
+        console.error("❌ Fehler beim Vergeben der Credits:", err);
         return res.status(500).send("Internal Server Error");
+      }
+    }
+
+    // --- ALTERNATIVE: invoice.payment_succeeded ---
+    if (event.type === "invoice.payment_succeeded") {
+      const invoice = event.data.object;
+      console.log(`💳 Invoice payment succeeded: ${invoice.id}`);
+
+      try {
+        await grantCreditsToUser(invoice);
+      } catch (err) {
+        console.error("❌ Fehler beim Vergeben der Credits:", err);
+        // Nicht mit 500 antworten, da invoice.paid Event noch kommt
       }
     }
 
@@ -129,7 +184,7 @@ app.post(
     if (event.type === "customer.subscription.deleted") {
       const subscription = event.data.object;
       const uid = subscription.metadata.uid;
-      console.log(`🚫 Abo gekündigt für User: ${uid}`); // ✅ DEBUG
+      console.log(`🚫 Abo gekündigt für User: ${uid}`);
 
       if (uid) {
         try {
@@ -154,10 +209,10 @@ app.post(
   }
 );
 
-// --- 3. JSON MIDDLEWARE ---
+// --- 4. JSON MIDDLEWARE ---
 app.use(express.json());
 
-// --- 4. CHECKOUT SESSION ---
+// --- 5. CHECKOUT SESSION ---
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
@@ -177,10 +232,10 @@ app.post("/create-checkout-session", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
-      client_reference_id: uid,
+      client_reference_id: uid, // ✅ UID für checkout.session.completed
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
-        metadata: { uid }, // ✅ UID wird hier gesetzt
+        metadata: { uid }, // ✅ UID für die Subscription
       },
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,

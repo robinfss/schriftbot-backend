@@ -40,40 +40,67 @@ app.post(
       console.error(`❌ Webhook Signatur Fehler: ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
-
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
 
+      // Wichtig für Abos: Falls keine Subscription ID da ist, ignorieren
       if (!invoice.subscription) {
         return res.json({ received: true });
       }
 
       try {
-        const subscription = await stripe.subscriptions.retrieve(
-          invoice.subscription
-        );
-        const uid = subscription.metadata.uid;
+        // --- 1. UID FINDEN (Mehrstufige Suche) ---
+        // Suche zuerst in den subscription_details (da liegen sie laut deinem Log)
+        let uid = invoice.subscription_details?.metadata?.uid;
+
+        // Falls nicht da, checke die Subscription direkt
+        if (!uid) {
+          const subscription = await stripe.subscriptions.retrieve(
+            invoice.subscription
+          );
+          uid = subscription.metadata.uid;
+        }
 
         if (!uid) {
-          console.error(`⚠️ Keine UID in Subscription ${invoice.subscription}`);
+          console.error(`⚠️ Keine UID gefunden für Invoice: ${invoice.id}`);
           return res.json({ status: "error", message: "UID missing" });
         }
 
-        const subscriptionItem = subscription.items.data[0];
-        const product = await stripe.products.retrieve(
-          subscriptionItem.price.product
-        );
+        // --- 2. PRODUKT-DATEN HOLEN ---
+        // Wir nehmen das erste Item der Rechnung
+        const lineItem = invoice.lines.data[0];
+        const productId = lineItem.price.product;
 
+        const product = await stripe.products.retrieve(productId);
+
+        // Metadaten vom Produkt auslesen
         const creditsToAdd = parseInt(product.metadata.credits || "0");
         const isUnlimited = product.metadata.isUnlimited === "true";
         const planName = product.metadata.planName || product.name;
 
-        // --- FIRESTORE UPDATE ---
+        console.log(` processing Plan: ${planName} for User: ${uid}`);
+
+        // --- 3. FIRESTORE UPDATE (Idempotent) ---
         const userRef = db.collection("users").doc(uid);
+
+        // Wir nutzen einen Transaction oder einen einfachen Check,
+        // um Doppelte Buchungen bei Re-Sends zu vermeiden
+        const userDoc = await userRef.get();
+        const userData = userDoc.exists ? userDoc.data() : {};
+        const alreadyProcessed = userData.payments?.some(
+          (p) => p.sessionId === invoice.id
+        );
+
+        if (alreadyProcessed) {
+          console.log(
+            `ℹ️ Zahlung ${invoice.id} bereits verarbeitet. Überspringe.`
+          );
+          return res.json({ received: true });
+        }
 
         await userRef.set(
           {
-            // 1. Credits raufrechnen (Addieren statt Überschreiben)
+            // Credits setzen (bei Unlimited 999k, sonst addieren)
             credits: isUnlimited
               ? 999999
               : admin.firestore.FieldValue.increment(creditsToAdd),
@@ -84,12 +111,12 @@ app.post(
             stripeCustomerId: invoice.customer,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
 
-            // 2. Zahlung in der Historie (Array) registrieren
+            // Zahlungshistorie erweitern
             payments: admin.firestore.FieldValue.arrayUnion({
-              amount: invoice.amount_paid / 100, // Stripe rechnet in Cents (z.B. 199 -> 1.99)
+              amount: invoice.amount_paid / 100,
               credits: creditsToAdd,
               date: new Date().toISOString(),
-              sessionId: invoice.id, // Hier nutzen wir die Invoice-ID als Referenz
+              sessionId: invoice.id, // Die Invoice ID ist hier der Anker
               status: "completed",
             }),
           },
@@ -97,14 +124,14 @@ app.post(
         );
 
         console.log(
-          `✅ User ${uid}: ${creditsToAdd} Credits addiert. Zahlung gespeichert.`
+          `✅ Erfolg: ${creditsToAdd} Credits für ${uid} hinterlegt.`
         );
       } catch (err) {
-        console.error("❌ Firestore Error:", err);
+        console.error("❌ Kritischer Fehler im Webhook:", err);
+        // Wir senden 500, damit Stripe weiß, dass es nochmal versuchen soll
         return res.status(500).send("Internal Server Error");
       }
     }
-
     if (event.type === "customer.subscription.deleted") {
       const subscription = event.data.object;
       const uid = subscription.metadata.uid;

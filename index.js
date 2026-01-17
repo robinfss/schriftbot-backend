@@ -22,15 +22,22 @@ try {
   if (admin.apps.length === 0) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
+      // Explizite Angabe der Project ID hilft Deno bei der Adressierung
+      projectId: serviceAccount.project_id,
     });
-    console.log("✅ Firebase App erfolgreich initialisiert");
+    console.log(
+      `✅ Firebase für Projekt ${serviceAccount.project_id} initialisiert`
+    );
   }
+
   db = admin.firestore();
+  // Diese Einstellung hilft gegen "Undefined"-Fehler in Firestore
+  db.settings({ ignoreUndefinedProperties: true });
 } catch (error) {
   console.error("❌ Kritischer Fehler bei Firebase-Init:", error.message);
 }
 
-// --- 2. STRIPE & EXPRESS SETUP ---
+// --- 2. STRIPE SETUP ---
 const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY"));
 const app = express();
 app.use(cors());
@@ -44,6 +51,7 @@ app.post(
     let event;
 
     try {
+      // Deno benötigt zwingend die asynchrone Variante für WebCrypto
       event = await stripe.webhooks.constructEventAsync(
         req.body,
         sig,
@@ -57,11 +65,9 @@ app.post(
     console.log(`🔔 Event erhalten: ${event.type}`);
 
     try {
-      // ERSTKAUF
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
         const uid = session.client_reference_id;
-        console.log(`🔍 Checkout Session für UID: ${uid}`);
 
         if (uid) {
           const sessionWithItems = await stripe.checkout.sessions.retrieve(
@@ -70,26 +76,24 @@ app.post(
           );
 
           const product = sessionWithItems.line_items.data[0].price.product;
-          const creditsToAdd = parseInt(product.metadata.credits || "0");
-          const isUnlimited = product.metadata.isUnlimited === "true";
-          const planName = product.metadata.planName || product.name;
 
-          console.log(
-            `🚀 Starte Firestore Update für User ${uid} (+${creditsToAdd} Credits)`
-          );
-          await updateFirestoreUser(uid, {
-            creditsToAdd,
-            isUnlimited,
-            planName,
-            subscriptionId: session.subscription,
-            customerId: session.customer,
-            invoiceId: session.invoice,
-            isRenewal: false,
-          });
+          // WICHTIG: await Promise.all stellt sicher, dass Deno NICHT abschaltet
+          // Wir geben dem Ganzen einen kleinen Zeitpuffer
+          await Promise.all([
+            updateFirestoreUser(uid, {
+              creditsToAdd: parseInt(product.metadata.credits || "0"),
+              isUnlimited: product.metadata.isUnlimited === "true",
+              planName: product.metadata.planName || product.name,
+              subscriptionId: session.subscription,
+              customerId: session.customer,
+              invoiceId: session.invoice,
+              isRenewal: false,
+            }),
+            new Promise((resolve) => setTimeout(resolve, 500)), // 500ms Puffer
+          ]);
         }
       }
 
-      // MONATLICHE VERLÄNGERUNG
       if (event.type === "invoice.paid") {
         const invoice = event.data.object;
         if (invoice.billing_reason === "subscription_cycle") {
@@ -97,7 +101,6 @@ app.post(
             invoice.subscription
           );
           const uid = subscription.metadata.uid;
-          console.log(`🔍 Verlängerung für UID: ${uid}`);
 
           if (uid) {
             const product = await stripe.products.retrieve(
@@ -116,12 +119,10 @@ app.post(
         }
       }
 
-      // KÜNDIGUNG
       if (event.type === "customer.subscription.deleted") {
         const subscription = event.data.object;
         const uid = subscription.metadata.uid;
         if (uid) {
-          console.log(`🚫 Abo-Kündigung für UID: ${uid}`);
           await db.collection("users").doc(uid).set(
             {
               credits: 0,
@@ -131,45 +132,35 @@ app.post(
             },
             { merge: true }
           );
+          console.log(`🚫 Abo für ${uid} beendet.`);
         }
       }
     } catch (processErr) {
-      console.error(
-        "❌ Fehler bei der Webhook-Verarbeitung:",
-        processErr.message
-      );
+      console.error("❌ Webhook Processing Error:", processErr.message);
     }
 
-    // Wichtig: Erst antworten, wenn alle Awaits durch sind!
     res.json({ received: true });
   }
 );
 
-// --- 4. HILFSFUNKTION (Mit mehr Logs) ---
+// --- 4. HILFSFUNKTION ---
 async function updateFirestoreUser(uid, data) {
-  if (!db) {
-    console.error("❌ Firestore DB ist nicht initialisiert!");
-    return;
-  }
-
-  // LOG ZUR KONTROLLE: In welches Projekt schreiben wir?
-  const projectId = admin.app().options.credential.projectId || "unbekannt";
-  console.log(
-    `📡 Versuche Schreibvorgang in Projekt: ${projectId} | Pfad: users/${uid}`
-  );
+  if (!db) return;
 
   try {
     const userRef = db.collection("users").doc(uid);
+    const doc = await userRef.get();
 
-    // Wir setzen ein Timeout, falls Firestore "hängt"
-    const timeout = new Promise((_, reject) =>
-      setTimeout(
-        () => reject(new Error("Firestore Timeout nach 10 Sekunden")),
-        10000
-      )
-    );
+    if (
+      doc.exists &&
+      doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
+    ) {
+      console.log("⚠️ Dublette: Rechnung bereits verarbeitet.");
+      return;
+    }
 
-    const writeTask = userRef.set(
+    // Wir schreiben nun in Firestore
+    await userRef.set(
       {
         credits: data.isUnlimited
           ? 999999
@@ -188,27 +179,19 @@ async function updateFirestoreUser(uid, data) {
       { merge: true }
     );
 
-    // Rennen zwischen Schreibvorgang und Timeout
-    await Promise.race([writeTask, timeout]);
-
-    console.log(`✅ Dokument für ${uid} erfolgreich in Firestore gespeichert!`);
+    console.log(`✅ Firestore erfolgreich für ${uid} aktualisiert.`);
   } catch (error) {
-    console.error(
-      `❌ KRITISCHER FEHLER beim Firestore-Schreiben:`,
-      error.message
-    );
-    console.error(`Details:`, JSON.stringify(error));
+    console.error(`❌ Fehler beim Schreiben in Firestore: ${error.message}`);
+    throw error; // Wichtig für das Promise.all oben
   }
 }
-// --- 5. ÜBRIGE API ENDPUNKTE ---
+
+// --- 5. WEITERE ENDPUNKTE ---
 app.use(express.json());
 
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { uid, email, priceId } = req.body;
-    if (!uid || !priceId)
-      return res.status(400).json({ error: "Missing data" });
-
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
@@ -227,17 +210,13 @@ app.post("/create-checkout-session", async (req, res) => {
 app.post("/delete-user-data", async (req, res) => {
   const { uid } = req.body;
   try {
-    if (!db) throw new Error("DB nicht bereit");
     const userRef = db.collection("users").doc(uid);
     const userDoc = await userRef.get();
-
     if (userDoc.exists) {
       const userData = userDoc.data();
-      if (userData.stripeCustomerId) {
+      if (userData.stripeCustomerId)
         await stripe.customers.del(userData.stripeCustomerId);
-      }
       await userRef.delete();
-      console.log(`✅ User ${uid} gelöscht.`);
     }
     res.json({ success: true });
   } catch (err) {
@@ -245,7 +224,7 @@ app.post("/delete-user-data", async (req, res) => {
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "active", engine: "deno" }));
+app.get("/", (req, res) => res.send("Deno Backend Active"));
 
 const PORT = Deno.env.get("PORT") || 8000;
 app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));

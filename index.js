@@ -1,32 +1,51 @@
-// Deno benötigt kein require("dotenv").config(),
-// Umgebungsvariablen werden direkt via Deno.env.get() gelesen.
-
 import express from "npm:express";
 import cors from "npm:cors";
 import Stripe from "npm:stripe";
 import admin from "npm:firebase-admin";
 
+// --- 1. FIREBASE INITIALISIERUNG (Einmalig & Sicher) ---
+let db;
+
+try {
+  const serviceAccountVar = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
+
+  if (!serviceAccountVar) {
+    throw new Error("Umgebungsvariable FIREBASE_SERVICE_ACCOUNT fehlt!");
+  }
+
+  const serviceAccount = JSON.parse(serviceAccountVar);
+
+  // WICHTIG: Korrigiert Zeilenumbrüche im Private Key (oft ein Problem bei Env-Vars)
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(
+      /\\n/g,
+      "\n"
+    );
+  }
+
+  if (admin.apps.length === 0) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log("✅ Firebase App erfolgreich initialisiert");
+  }
+
+  db = admin.firestore();
+} catch (error) {
+  console.error(
+    "❌ Kritischer Fehler bei der Firebase-Initialisierung:",
+    error.message
+  );
+}
+
+// --- 2. STRIPE & EXPRESS SETUP ---
 const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY"));
 const app = express();
 
-// --- 1. FIREBASE INITIALISIERUNG ---
-// In Deno Deploy laden wir das Service-Account-JSON am besten über eine Env-Variable
-const serviceAccountVar = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
-const serviceAccount = serviceAccountVar ? JSON.parse(serviceAccountVar) : null;
-
-if (!admin.apps.length && serviceAccount) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-} else if (!serviceAccount) {
-  console.error("❌ FIREBASE_SERVICE_ACCOUNT Env-Variable fehlt!");
-}
-
-const db = admin.firestore();
-
 app.use(cors());
 
-// --- 2. STRIPE WEBHOOK ---
+// --- 3. STRIPE WEBHOOK ---
+// Wichtig: express.raw() muss VOR express.json() kommen, damit die Signatur-Prüfung klappt
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -35,7 +54,6 @@ app.post(
     let event;
 
     try {
-      // req.body ist bei express.raw ein Buffer, das funktioniert auch in Deno
       event = stripe.webhooks.constructEvent(
         req.body,
         sig,
@@ -48,40 +66,39 @@ app.post(
 
     console.log("✅ Webhook empfangen:", event.type);
 
+    // ERSTKAUF
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       const uid = session.client_reference_id;
 
-      if (!uid) {
-        console.error("❌ Keine UID in Checkout Session gefunden");
-        return res.json({ received: true });
-      }
+      if (uid) {
+        try {
+          const sessionWithItems = await stripe.checkout.sessions.retrieve(
+            session.id,
+            { expand: ["line_items.data.price.product"] }
+          );
 
-      try {
-        const sessionWithItems = await stripe.checkout.sessions.retrieve(
-          session.id,
-          { expand: ["line_items.data.price.product"] }
-        );
+          const product = sessionWithItems.line_items.data[0].price.product;
+          const creditsToAdd = parseInt(product.metadata.credits || "0");
+          const isUnlimited = product.metadata.isUnlimited === "true";
+          const planName = product.metadata.planName || product.name;
 
-        const product = sessionWithItems.line_items.data[0].price.product;
-        const creditsToAdd = parseInt(product.metadata.credits || "0");
-        const isUnlimited = product.metadata.isUnlimited === "true";
-        const planName = product.metadata.planName || product.name;
-
-        await updateFirestoreUser(uid, {
-          creditsToAdd,
-          isUnlimited,
-          planName,
-          subscriptionId: session.subscription,
-          customerId: session.customer,
-          invoiceId: session.invoice,
-          isRenewal: false,
-        });
-      } catch (err) {
-        console.error("❌ Fehler bei Erstkauf:", err);
+          await updateFirestoreUser(uid, {
+            creditsToAdd,
+            isUnlimited,
+            planName,
+            subscriptionId: session.subscription,
+            customerId: session.customer,
+            invoiceId: session.invoice,
+            isRenewal: false,
+          });
+        } catch (err) {
+          console.error("❌ Fehler bei Erstkauf:", err);
+        }
       }
     }
 
+    // VERLÄNGERUNG
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
       if (invoice.billing_reason === "subscription_cycle") {
@@ -115,6 +132,7 @@ app.post(
       }
     }
 
+    // KÜNDIGUNG
     if (event.type === "customer.subscription.deleted") {
       const subscription = event.data.object;
       const uid = subscription.metadata.uid;
@@ -128,6 +146,7 @@ app.post(
           },
           { merge: true }
         );
+        console.log(`🚫 Abo für User ${uid} beendet.`);
       }
     }
 
@@ -135,8 +154,9 @@ app.post(
   }
 );
 
-// Hilfsfunktion (unverändert, nur Deno-kompatible Imports genutzt)
+// --- 4. HILFSFUNKTION ---
 async function updateFirestoreUser(uid, data) {
+  if (!db) return;
   const userRef = db.collection("users").doc(uid);
   const doc = await userRef.get();
 
@@ -144,6 +164,7 @@ async function updateFirestoreUser(uid, data) {
     doc.exists &&
     doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
   ) {
+    console.log("⚠️ Invoice bereits verarbeitet.");
     return;
   }
 
@@ -161,19 +182,24 @@ async function updateFirestoreUser(uid, data) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       payments: admin.firestore.FieldValue.arrayUnion({
         invoiceId: data.invoiceId,
+        credits: data.creditsToAdd,
         date: new Date().toISOString(),
       }),
     },
     { merge: true }
   );
+  console.log(`✅ User ${uid} aktualisiert.`);
 }
 
-// --- 3. CHECKOUT & API ---
+// --- 5. ÜBRIGE API ENDPUNKTE ---
 app.use(express.json());
 
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { uid, email, priceId } = req.body;
+    if (!uid || !priceId)
+      return res.status(400).json({ error: "Missing data" });
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
@@ -189,8 +215,10 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-app.get("/", (req, res) => res.send("Deno Backend Active"));
+app.get("/", (req, res) =>
+  res.json({ status: "active", system: "deno-deploy" })
+);
 
-// Starten des Servers
+// Start
 const PORT = Deno.env.get("PORT") || 8000;
-app.listen(PORT, () => console.log(`🚀 Deno Server läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));

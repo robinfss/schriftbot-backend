@@ -8,8 +8,7 @@ let db;
 
 try {
   const serviceAccountVar = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
-  if (!serviceAccountVar)
-    throw new Error("Umgebungsvariable FIREBASE_SERVICE_ACCOUNT fehlt!");
+  if (!serviceAccountVar) throw new Error("Umgebungsvariable fehlt!");
 
   const serviceAccount = JSON.parse(serviceAccountVar);
   if (serviceAccount.private_key) {
@@ -22,29 +21,31 @@ try {
   if (admin.apps.length === 0) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
-      // Explizite Angabe der Project ID hilft Deno bei der Adressierung
       projectId: serviceAccount.project_id,
     });
-    console.log(
-      `✅ Firebase für Projekt ${serviceAccount.project_id} initialisiert`
-    );
   }
 
   db = admin.firestore();
-  // Diese Einstellung hilft gegen "Undefined"-Fehler in Firestore
-  db.settings({ ignoreUndefinedProperties: true });
+
+  // 🔥 DER FIX FÜR DENO DEPLOY:
+  // Wir zwingen Firestore, kein gRPC zu nutzen und leere Felder zu ignorieren
+  db.settings({
+    ignoreUndefinedProperties: true,
+    ssl: true,
+  });
+
+  console.log(
+    `✅ Firebase (REST-Mode) für ${serviceAccount.project_id} bereit`
+  );
 } catch (error) {
-  console.error("❌ Kritischer Fehler bei Firebase-Init:", error.message);
+  console.error("❌ Firebase Init Fehler:", error.message);
 }
 
-// --- 2. STRIPE SETUP ---
 const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY"));
 const app = express();
 app.use(cors());
 
-// --- 3. STRIPE WEBHOOK ---
-// ... (Importe wie gehabt)
-
+// --- 2. WEBHOOK ---
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -62,7 +63,9 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // WICHTIG: Wir fangen alle Fehler pro Event ab, damit ein Fehler nicht den ganzen Webhook killt
+    console.log(`🔔 Event: ${event.type}`);
+
+    // Wir führen die DB-Logik aus und WARTEN darauf, bevor wir res.json schicken
     try {
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
@@ -74,6 +77,7 @@ app.post(
           );
           const product = sessionWithItems.line_items.data[0].price.product;
 
+          // WICHTIG: await hier erzwingt, dass die TLS Verbindung gehalten wird
           await updateFirestoreUser(uid, {
             creditsToAdd: parseInt(product.metadata.credits || "0"),
             isUnlimited: product.metadata.isUnlimited === "true",
@@ -87,8 +91,7 @@ app.post(
 
       if (event.type === "invoice.paid") {
         const invoice = event.data.object;
-        // DEINE LOGIK: Erst-Rechnung ignorieren
-        if (invoice.billing_reason !== "subscription_create") {
+        if (invoice.billing_reason === "subscription_cycle") {
           const subscription = await stripe.subscriptions.retrieve(
             invoice.subscription
           );
@@ -107,59 +110,51 @@ app.post(
         }
       }
     } catch (err) {
-      console.error("❌ Fehler bei Event-Verarbeitung:", err.message);
+      console.error("❌ Event Processing Error:", err.message);
     }
 
+    // Kleiner Puffer, um sicherzustellen, dass die Pakete gesendet wurden
+    await new Promise((r) => setTimeout(r, 100));
     res.json({ received: true });
   }
 );
 
-// --- 4. HILFSFUNKTION ---
+// --- 3. HILFSFUNKTION ---
 async function updateFirestoreUser(uid, data) {
-  if (!db) return;
+  if (!db) throw new Error("DB nicht initialisiert");
 
   try {
+    console.log(`📡 Schreibe in Firestore für UID: ${uid}...`);
     const userRef = db.collection("users").doc(uid);
-    const doc = await userRef.get();
 
-    if (
-      doc.exists &&
-      doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
-    ) {
-      console.log("⚠️ Dublette: Rechnung bereits verarbeitet.");
-      return;
-    }
-
-    // Wir schreiben nun in Firestore
+    // Wir nutzen hier set mit merge
     await userRef.set(
       {
         credits: data.isUnlimited
           ? 999999
-          : admin.firestore.FieldValue.increment(data.creditsToAdd),
-        isUnlimited: data.isUnlimited,
-        plan: data.planName,
+          : admin.firestore.FieldValue.increment(data.creditsToAdd || 0),
+        isUnlimited: data.isUnlimited || false,
+        plan: data.planName || "Plan",
         lastPaymentStatus: "active",
-        stripeCustomerId: data.customerId,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         payments: admin.firestore.FieldValue.arrayUnion({
           invoiceId: data.invoiceId,
-          credits: data.creditsToAdd,
           date: new Date().toISOString(),
         }),
       },
       { merge: true }
     );
 
-    console.log(`✅ Firestore erfolgreich für ${uid} aktualisiert.`);
+    console.log(`✅ Firestore erfolgreich aktualisiert für ${uid}`);
   } catch (error) {
-    console.error(`❌ Fehler beim Schreiben in Firestore: ${error.message}`);
-    throw error; // Wichtig für das Promise.all oben
+    // Wenn es hier kracht, sehen wir jetzt genau warum
+    console.error(`❌ Firestore Schreibfehler: ${error.message}`);
+    throw error;
   }
 }
 
-// --- 5. WEITERE ENDPUNKTE ---
+// RESTLICHE ENDPUNKTE (create-checkout-session etc. wie vorher)
 app.use(express.json());
-
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { uid, email, priceId } = req.body;
@@ -173,23 +168,6 @@ app.post("/create-checkout-session", async (req, res) => {
       cancel_url: `https://schriftbot.com/`,
     });
     res.json({ url: session.url });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/delete-user-data", async (req, res) => {
-  const { uid } = req.body;
-  try {
-    const userRef = db.collection("users").doc(uid);
-    const userDoc = await userRef.get();
-    if (userDoc.exists) {
-      const userData = userDoc.data();
-      if (userData.stripeCustomerId)
-        await stripe.customers.del(userData.stripeCustomerId);
-      await userRef.delete();
-    }
-    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

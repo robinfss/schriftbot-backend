@@ -177,7 +177,12 @@ app.post("/webhook", async (c) => {
     const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
     if (!webhookSecret) throw new Error("STRIPE_WEBHOOK_SECRET fehlt!");
 
-    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+    // 🔥 FIX: constructEventAsync statt constructEvent
+    event = await stripe.webhooks.constructEventAsync(
+      rawBody,
+      sig,
+      webhookSecret
+    );
     console.log("✅ Event verifiziert:", event.type);
   } catch (err: any) {
     console.error("❌ Webhook Signatur Fehler:", err.message);
@@ -190,19 +195,29 @@ app.post("/webhook", async (c) => {
       console.log("🛒 Checkout Session:", session.id);
 
       const uid = session.client_reference_id;
-      if (!uid) return c.json({ received: true });
+      if (!uid) {
+        console.log("⚠️ Keine UID");
+        return c.json({ received: true });
+      }
+
+      console.log("👤 UID:", uid);
 
       const sessionFull = await stripe.checkout.sessions.retrieve(session.id, {
         expand: ["line_items.data.price.product"],
       });
 
       const lineItem = sessionFull.line_items?.data[0];
-      if (!lineItem) return c.json({ received: true });
+      if (!lineItem) {
+        console.log("❌ Keine Line Items");
+        return c.json({ received: true });
+      }
 
       const product = lineItem.price?.product as Stripe.Product;
       const credits = Number(product.metadata?.credits || 0);
       const isUnlimited = product.metadata?.isUnlimited === "true";
       const plan = product.metadata?.planName || product.name || "Unknown";
+
+      console.log("💳 Product:", { plan, credits, isUnlimited });
 
       await applyCredits(uid, {
         credits,
@@ -217,6 +232,7 @@ app.post("/webhook", async (c) => {
       console.log("🧾 Invoice paid:", invoice.id);
 
       if (invoice.billing_reason !== "subscription_cycle") {
+        console.log("⚠️ Skip: billing_reason =", invoice.billing_reason);
         return c.json({ received: true });
       }
 
@@ -224,15 +240,26 @@ app.post("/webhook", async (c) => {
         invoice.subscription as string
       );
       const uid = sub.metadata?.uid;
-      if (!uid) return c.json({ received: true });
+      if (!uid) {
+        console.log("⚠️ Keine UID in Subscription");
+        return c.json({ received: true });
+      }
+
+      console.log("👤 UID:", uid);
 
       const productId = invoice.lines.data[0]?.price?.product as string;
       const product = await stripe.products.retrieve(productId);
 
+      const credits = Number(product.metadata?.credits || 0);
+      const isUnlimited = product.metadata?.isUnlimited === "true";
+      const plan = product.metadata?.planName || product.name || "Unknown";
+
+      console.log("💳 Product:", { plan, credits, isUnlimited });
+
       await applyCredits(uid, {
-        credits: Number(product.metadata?.credits || 0),
-        isUnlimited: product.metadata?.isUnlimited === "true",
-        plan: product.metadata?.planName || product.name || "Unknown",
+        credits,
+        isUnlimited,
+        plan,
         invoiceId: invoice.id,
       });
     }
@@ -240,6 +267,7 @@ app.post("/webhook", async (c) => {
     return c.json({ received: true });
   } catch (err: any) {
     console.error("❌ Webhook Verarbeitung Fehler:", err);
+    console.error(err.stack);
     return c.text(`Processing Error: ${err.message}`, 500);
   }
 });
@@ -252,6 +280,8 @@ app.post("/create-checkout-session", async (c) => {
       return c.json({ error: "Missing parameters" }, 400);
     }
 
+    console.log("🛒 Erstelle Session:", { uid, email, priceId });
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
@@ -262,6 +292,7 @@ app.post("/create-checkout-session", async (c) => {
       cancel_url: "https://schriftbot.com/",
     });
 
+    console.log("✅ Session:", session.id);
     return c.json({ url: session.url });
   } catch (err: any) {
     console.error("❌ Checkout Error:", err);
@@ -279,10 +310,12 @@ async function applyCredits(
     invoiceId: string;
   }
 ) {
-  console.log("💾 Credit-Vergabe:", uid, data);
+  console.log("💾 Starte Credit-Vergabe:", { uid, ...data });
 
   try {
     const user = (await getUser(uid)) || {};
+    console.log("📊 User geladen:", { uid, currentCredits: user.credits || 0 });
+
     const payments = user.payments || [];
 
     if (payments.some((p: any) => p.invoiceId === data.invoiceId)) {
@@ -293,6 +326,7 @@ async function applyCredits(
     const newCredits = data.isUnlimited
       ? 999999
       : (user.credits || 0) + data.credits;
+    console.log("➕ Neue Credits:", newCredits);
 
     await patchUser(uid, {
       credits: int(newCredits),
@@ -310,15 +344,20 @@ async function applyCredits(
       ]),
     });
 
-    console.log(`✅ Firestore: ${uid} → ${newCredits} Credits`);
+    console.log(
+      `✅ Firestore Update erfolgreich: ${uid} → ${newCredits} Credits`
+    );
   } catch (err: any) {
     console.error("❌ applyCredits Fehler:", err);
+    console.error(err.stack);
     throw err;
   }
 }
 
 // -------------------- HEALTH --------------------
-app.get("/", (c) => c.json({ status: "ok", runtime: "deno" }));
+app.get("/", (c) =>
+  c.json({ status: "ok", runtime: "deno", timestamp: new Date().toISOString() })
+);
 
 const port = Number(Deno.env.get("PORT")) || 8000;
 console.log(`🚀 Server auf Port ${port}`);

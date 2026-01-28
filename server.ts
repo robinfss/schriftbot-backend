@@ -1,8 +1,10 @@
 // deno run --allow-env --allow-net server.ts
 import { Hono } from "https://deno.land/x/hono@v3.11.7/mod.ts";
+import { cors } from "https://deno.land/x/hono@v3.11.7/middleware/cors.ts";
 import Stripe from "npm:stripe";
 
 const app = new Hono();
+app.use("*", cors({ origin: "*" }));
 
 // -------------------- STRIPE INIT --------------------
 const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
@@ -43,9 +45,8 @@ function parseFields(fields: any) {
     else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
     else if (v.arrayValue)
       obj[k] =
-        v.arrayValue.values?.map((x: any) =>
-          parseFields(x.mapValue.fields)
-        ) ?? [];
+        v.arrayValue.values?.map((x: any) => parseFields(x.mapValue.fields)) ??
+        [];
   }
   return obj;
 }
@@ -67,7 +68,11 @@ app.post("/webhook", async (c) => {
 
   let event;
   try {
-    event = stripe.webhooks.constructEvent(rawBody, sig, Deno.env.get("STRIPE_WEBHOOK_SECRET") || "");
+    event = stripe.webhooks.constructEvent(
+      rawBody,
+      sig,
+      Deno.env.get("STRIPE_WEBHOOK_SECRET") || ""
+    );
   } catch (err) {
     console.error("❌ Ungültige Stripe Webhook Signatur:", err.message);
     return c.text("Invalid signature", 400);
@@ -75,7 +80,6 @@ app.post("/webhook", async (c) => {
 
   console.log("✅ Webhook:", event.type);
 
-  // -------------------- CHECKOUT COMPLETED --------------------
   if (event.type === "checkout.session.completed") {
     const session: any = event.data.object;
     const uid = session.client_reference_id;
@@ -98,16 +102,18 @@ app.post("/webhook", async (c) => {
     });
   }
 
-  // -------------------- MONTHLY RENEWAL --------------------
   if (event.type === "invoice.paid") {
     const invoice: any = event.data.object;
-    if (invoice.billing_reason !== "subscription_cycle") return c.json({ received: true });
+    if (invoice.billing_reason !== "subscription_cycle")
+      return c.json({ received: true });
 
     const sub = await stripe.subscriptions.retrieve(invoice.subscription);
     const uid = sub.metadata?.uid;
     if (!uid) return c.json({ received: true });
 
-    const product = await stripe.products.retrieve(invoice.lines.data[0].price.product);
+    const product = await stripe.products.retrieve(
+      invoice.lines.data[0].price.product
+    );
 
     await applyCredits(uid, {
       credits: Number(product.metadata?.credits || 0),
@@ -120,21 +126,51 @@ app.post("/webhook", async (c) => {
   return c.json({ received: true });
 });
 
-// -------------------- APPLY CREDITS (IDEMPOTENT) --------------------
+// -------------------- CREATE CHECKOUT SESSION --------------------
+app.post("/create-checkout-session", async (c) => {
+  try {
+    const { uid, email, priceId } = await c.req.json();
+
+    if (!uid || !email || !priceId) return c.text("Missing parameters", 400);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: email,
+      client_reference_id: uid,
+      line_items: [{ price: priceId, quantity: 1 }],
+      subscription_data: { metadata: { uid } },
+      success_url: "https://schriftbot.com/success",
+      cancel_url: "https://schriftbot.com/",
+    });
+
+    return c.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Checkout Error:", err);
+    return c.text("Server error", 500);
+  }
+});
+
+// -------------------- APPLY CREDITS --------------------
 async function applyCredits(
   uid: string,
-  data: { credits: number; isUnlimited: boolean; plan: string; invoiceId: string }
+  data: {
+    credits: number;
+    isUnlimited: boolean;
+    plan: string;
+    invoiceId: string;
+  }
 ) {
   const user = (await getUser(uid)) || {};
   const payments = user.payments || [];
 
-  // Idempotenz-Check
   if (payments.some((p: any) => p.invoiceId === data.invoiceId)) {
     console.log("⚠️ Invoice bereits verarbeitet:", data.invoiceId);
     return;
   }
 
-  const newCredits = data.isUnlimited ? 999999 : (user.credits || 0) + data.credits;
+  const newCredits = data.isUnlimited
+    ? 999999
+    : (user.credits || 0) + data.credits;
 
   await patchUser(uid, {
     credits: int(newCredits),

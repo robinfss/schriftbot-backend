@@ -1,6 +1,6 @@
 // deno run --allow-env --allow-net server.ts
 import { Hono } from "https://deno.land/x/hono@v3.11.7/mod.ts";
-import { cors } from "https://deno.land/x/hono@v3.11.7/middleware/cors.ts";
+import { cors } from "https://deno.land/x/hono@v3.11.7/cors.ts";
 import Stripe from "npm:stripe";
 
 const app = new Hono();

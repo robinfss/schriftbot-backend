@@ -2,7 +2,7 @@
 // deno run --allow-env --allow-net server.ts
 import { Hono } from "https://deno.land/x/hono@v3.11.7/mod.ts";
 import { cors } from "https://deno.land/x/hono@v3.11.7/middleware/cors/index.ts";
-import Stripe from "npm:stripe@14.11.0";
+import Stripe from "npm:stripe";
 
 const app = new Hono();
 app.use("*", cors({ origin: "*" }));
@@ -13,7 +13,6 @@ if (!stripeKey) throw new Error("STRIPE_SECRET_KEY fehlt!");
 
 const stripe = new Stripe(stripeKey, {
   apiVersion: "2024-11-20.acacia",
-  typescript: true,
 });
 
 // -------------------- FIRESTORE REST --------------------
@@ -31,7 +30,6 @@ const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/dat
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
 async function getAccessToken(): Promise<string> {
-  // Token wiederverwenden wenn noch gültig
   if (cachedToken && cachedToken.expiresAt > Date.now()) {
     return cachedToken.token;
   }
@@ -52,7 +50,6 @@ async function getAccessToken(): Promise<string> {
 
   const signatureInput = `${header}.${payload}`;
 
-  // Private Key importieren
   const pemKey = SERVICE_ACCOUNT.private_key
     .replace(/-----BEGIN PRIVATE KEY-----/, "")
     .replace(/-----END PRIVATE KEY-----/, "")
@@ -83,7 +80,6 @@ async function getAccessToken(): Promise<string> {
 
   const jwt = `${signatureInput}.${signatureBase64}`;
 
-  // JWT gegen Access Token tauschen
   const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -99,7 +95,7 @@ async function getAccessToken(): Promise<string> {
 
   cachedToken = {
     token: tokenData.access_token,
-    expiresAt: Date.now() + tokenData.expires_in * 1000 - 60000, // 1 min Puffer
+    expiresAt: Date.now() + tokenData.expires_in * 1000 - 60000,
   };
 
   return cachedToken.token;
@@ -156,7 +152,6 @@ function parseFields(fields: any): any {
   return obj;
 }
 
-// Firestore Helper
 const str = (v: string) => ({ stringValue: v });
 const int = (v: number) => ({ integerValue: String(v) });
 const bool = (v: boolean) => ({ booleanValue: v });
@@ -174,21 +169,15 @@ app.post("/webhook", async (c) => {
     return c.text("Missing signature", 400);
   }
 
-  // WICHTIG: Als Uint8Array für Stripe
   const rawBody = new Uint8Array(await c.req.raw.arrayBuffer());
   console.log("📦 Body Size:", rawBody.length);
 
   let event;
   try {
     const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
-    if (!webhookSecret) {
-      throw new Error("STRIPE_WEBHOOK_SECRET fehlt!");
-    }
-
-    console.log("🔑 Secret vorhanden:", !!webhookSecret);
+    if (!webhookSecret) throw new Error("STRIPE_WEBHOOK_SECRET fehlt!");
 
     event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
-
     console.log("✅ Event verifiziert:", event.type);
   } catch (err: any) {
     console.error("❌ Webhook Signatur Fehler:", err.message);
@@ -201,29 +190,19 @@ app.post("/webhook", async (c) => {
       console.log("🛒 Checkout Session:", session.id);
 
       const uid = session.client_reference_id;
-      if (!uid) {
-        console.log("⚠️ Keine UID in Session");
-        return c.json({ received: true });
-      }
-
-      console.log("👤 UID:", uid);
+      if (!uid) return c.json({ received: true });
 
       const sessionFull = await stripe.checkout.sessions.retrieve(session.id, {
         expand: ["line_items.data.price.product"],
       });
 
       const lineItem = sessionFull.line_items?.data[0];
-      if (!lineItem) {
-        console.error("❌ Keine Line Items");
-        return c.json({ received: true });
-      }
+      if (!lineItem) return c.json({ received: true });
 
       const product = lineItem.price?.product as Stripe.Product;
       const credits = Number(product.metadata?.credits || 0);
       const isUnlimited = product.metadata?.isUnlimited === "true";
       const plan = product.metadata?.planName || product.name || "Unknown";
-
-      console.log("💳 Product:", { plan, credits, isUnlimited });
 
       await applyCredits(uid, {
         credits,
@@ -238,7 +217,6 @@ app.post("/webhook", async (c) => {
       console.log("🧾 Invoice paid:", invoice.id);
 
       if (invoice.billing_reason !== "subscription_cycle") {
-        console.log("⚠️ Nicht subscription_cycle:", invoice.billing_reason);
         return c.json({ received: true });
       }
 
@@ -246,27 +224,15 @@ app.post("/webhook", async (c) => {
         invoice.subscription as string
       );
       const uid = sub.metadata?.uid;
-
-      if (!uid) {
-        console.log("⚠️ Keine UID in Subscription");
-        return c.json({ received: true });
-      }
-
-      console.log("👤 UID:", uid);
+      if (!uid) return c.json({ received: true });
 
       const productId = invoice.lines.data[0]?.price?.product as string;
       const product = await stripe.products.retrieve(productId);
 
-      const credits = Number(product.metadata?.credits || 0);
-      const isUnlimited = product.metadata?.isUnlimited === "true";
-      const plan = product.metadata?.planName || product.name || "Unknown";
-
-      console.log("💳 Product:", { plan, credits, isUnlimited });
-
       await applyCredits(uid, {
-        credits,
-        isUnlimited,
-        plan,
+        credits: Number(product.metadata?.credits || 0),
+        isUnlimited: product.metadata?.isUnlimited === "true",
+        plan: product.metadata?.planName || product.name || "Unknown",
         invoiceId: invoice.id,
       });
     }
@@ -274,7 +240,6 @@ app.post("/webhook", async (c) => {
     return c.json({ received: true });
   } catch (err: any) {
     console.error("❌ Webhook Verarbeitung Fehler:", err);
-    console.error(err.stack);
     return c.text(`Processing Error: ${err.message}`, 500);
   }
 });
@@ -283,12 +248,9 @@ app.post("/webhook", async (c) => {
 app.post("/create-checkout-session", async (c) => {
   try {
     const { uid, email, priceId } = await c.req.json();
-
     if (!uid || !email || !priceId) {
       return c.json({ error: "Missing parameters" }, 400);
     }
-
-    console.log("🛒 Erstelle Checkout Session:", { uid, email, priceId });
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
@@ -300,7 +262,6 @@ app.post("/create-checkout-session", async (c) => {
       cancel_url: "https://schriftbot.com/",
     });
 
-    console.log("✅ Session erstellt:", session.id);
     return c.json({ url: session.url });
   } catch (err: any) {
     console.error("❌ Checkout Error:", err);
@@ -318,13 +279,12 @@ async function applyCredits(
     invoiceId: string;
   }
 ) {
-  console.log("💾 Starte Credit-Vergabe für:", uid, data);
+  console.log("💾 Credit-Vergabe:", uid, data);
 
   try {
     const user = (await getUser(uid)) || {};
     const payments = user.payments || [];
 
-    // Duplikat-Check
     if (payments.some((p: any) => p.invoiceId === data.invoiceId)) {
       console.log("⚠️ Invoice bereits verarbeitet:", data.invoiceId);
       return;
@@ -333,13 +293,6 @@ async function applyCredits(
     const newCredits = data.isUnlimited
       ? 999999
       : (user.credits || 0) + data.credits;
-
-    console.log(
-      "📊 Alte Credits:",
-      user.credits || 0,
-      "→ Neue Credits:",
-      newCredits
-    );
 
     await patchUser(uid, {
       credits: int(newCredits),
@@ -357,7 +310,7 @@ async function applyCredits(
       ]),
     });
 
-    console.log(`✅ Firestore aktualisiert: ${uid} → ${newCredits} Credits`);
+    console.log(`✅ Firestore: ${uid} → ${newCredits} Credits`);
   } catch (err: any) {
     console.error("❌ applyCredits Fehler:", err);
     throw err;
@@ -365,18 +318,8 @@ async function applyCredits(
 }
 
 // -------------------- HEALTH --------------------
-app.get("/", (c) => {
-  return c.json({
-    status: "ok",
-    runtime: "deno",
-    timestamp: new Date().toISOString(),
-  });
-});
+app.get("/", (c) => c.json({ status: "ok", runtime: "deno" }));
 
-// -------------------- START SERVER --------------------
 const port = Number(Deno.env.get("PORT")) || 8000;
-
-console.log(`🚀 Server startet auf Port ${port}`);
-console.log(`📍 Webhook URL: http://localhost:${port}/webhook`);
-
+console.log(`🚀 Server auf Port ${port}`);
 Deno.serve({ port }, app.fetch);

@@ -1,0 +1,11 @@
+{
+  "imports": {
+    "hono": "https://deno.land/x/hono@v3.11.7/mod.ts",
+    "hono/cors": "https://deno.land/x/hono@v3.11.7/middleware/cors/index.ts",
+    "stripe": "npm:stripe@^14.0.0"
+  },
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "start": "deno run --allow-env --allow-net server.ts"
+  }
+}
